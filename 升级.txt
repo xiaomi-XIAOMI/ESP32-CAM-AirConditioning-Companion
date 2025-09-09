@@ -1,0 +1,476 @@
+/**
+ * ESP32-CAM空调伴侣升级版
+ * 功能: 红外学习控制、OLED状态显示、远程控制、电池电量监测
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+
+// 网络配置
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+WebServer server(80);
+
+// 引脚定义
+#define RECV_PIN 2         // 红外接收引脚
+#define SEND_PIN 4         // 红外发射引脚
+#define OLED_SDA 14        // OLED SDA
+#define OLED_SCL 15        // OLED SCL
+#define BATTERY_PIN 35     // 电池检测引脚
+
+// OLED显示屏定义
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// 红外接收和发射
+IRrecv irrecv(RECV_PIN);
+IRsend irsend(SEND_PIN);
+decode_results results;
+
+// 空调状态
+struct AirconState {
+  bool power;            // 电源状态
+  int mode;              // 模式: 0-自动,1-制冷,2-制热,3-除湿,4-送风
+  int temperature;       // 温度(℃)
+  int fanSpeed;          // 风速: 0-自动,1-低速,2-中速,3-高速
+  bool swing;            // 扫风
+  float batteryLevel;    // 电池电量(0-100%)
+  bool timerEnabled;     // 定时器启用
+  float timerHours;      // 定时小时数
+} aircon;
+
+// 红外命令存储
+#define COMMAND_COUNT 12
+uint64_t irCommands[COMMAND_COUNT];  // 存储12个红外命令
+
+// EEPROM地址定义
+#define EEPROM_SIZE 512
+#define IR_DATA_ADDR 0
+#define STATE_DATA_ADDR 100
+
+// 初始化
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32空调伴侣启动中...");
+  
+  // 初始化引脚
+  pinMode(BATTERY_PIN, INPUT);
+  
+  // 初始化EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  loadSettings();
+  
+  // 初始化红外
+  irrecv.enableIRIn();
+  irsend.begin();
+  
+  // 初始化OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306显示屏初始化失败"));
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ESP32空调伴侣");
+  display.println("初始化中...");
+  display.display();
+  
+  // 连接WiFi
+  connectWiFi();
+  
+  // 启动Web服务器
+  setupServer();
+  
+  // 显示初始状态
+  updateDisplay();
+  
+  Serial.println("系统初始化完成");
+}
+
+// 主循环
+void loop() {
+  // 处理红外接收
+  if (irrecv.decode(&results)) {
+    handleIRCommand();
+    irrecv.resume();
+  }
+  
+  // 处理HTTP请求
+  server.handleClient();
+  
+  // 检查定时任务
+  checkTimer();
+  
+  // 更新电池状态
+  updateBatteryLevel();
+  
+  // 更新显示
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 5000) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  delay(10);
+}
+
+// 连接WiFi
+void connectWiFi() {
+  Serial.print("连接到WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.println("WiFi连接成功");
+  Serial.print("IP地址: ");
+  Serial.println(WiFi.localIP());
+  
+  // 启动mDNS服务
+  if (MDNS.begin("esp32-aircon")) {
+    Serial.println("mDNS服务已启动: http://esp32-aircon.local");
+  }
+}
+
+// 配置Web服务器
+void setupServer() {
+  // 获取当前状态
+  server.on("/status", HTTP_GET, []() {
+    DynamicJsonDocument doc(1024);
+    doc["power"] = aircon.power;
+    doc["mode"] = aircon.mode;
+    doc["temperature"] = aircon.temperature;
+    doc["fanSpeed"] = aircon.fanSpeed;
+    doc["swing"] = aircon.swing;
+    doc["battery"] = aircon.batteryLevel;
+    doc["timerEnabled"] = aircon.timerEnabled;
+    doc["timerHours"] = aircon.timerHours;
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
+  
+  // 控制空调
+  server.on("/control", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      String body = server.arg("plain");
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, body);
+      
+      if (!error) {
+        if (doc.containsKey("power")) aircon.power = doc["power"];
+        if (doc.containsKey("mode")) aircon.mode = doc["mode"];
+        if (doc.containsKey("temperature")) aircon.temperature = doc["temperature"];
+        if (doc.containsKey("fanSpeed")) aircon.fanSpeed = doc["fanSpeed"];
+        if (doc.containsKey("swing")) aircon.swing = doc["swing"];
+        
+        sendIRCommand();
+        saveSettings();
+        updateDisplay();
+        
+        server.send(200, "text/plain", "OK");
+      } else {
+        server.send(400, "text/plain", "JSON解析错误");
+      }
+    } else {
+      server.send(400, "text/plain", "缺少请求体");
+    }
+  });
+  
+  // 红外学习
+  server.on("/learn", HTTP_POST, []() {
+    if (server.hasArg("command")) {
+      int command = server.arg("command").toInt();
+      if (command >= 0 && command < COMMAND_COUNT) {
+        server.send(200, "text/plain", "开始学习，请按下遥控器对应按键");
+        learnIRCommand(command);
+        saveSettings();
+      } else {
+        server.send(400, "text/plain", "命令索引无效");
+      }
+    } else {
+      server.send(400, "text/plain", "缺少命令参数");
+    }
+  });
+  
+  // 定时设置
+  server.on("/timer", HTTP_POST, []() {
+    if (server.hasArg("hours")) {
+      float hours = server.arg("hours").toFloat();
+      aircon.timerHours = hours;
+      aircon.timerEnabled = (hours > 0);
+      saveSettings();
+      server.send(200, "text/plain", "定时设置成功");
+    } else if (server.hasArg("enable")) {
+      aircon.timerEnabled = (server.arg("enable") == "true");
+      saveSettings();
+      server.send(200, "text/plain", "定时状态已更新");
+    } else {
+      server.send(400, "text/plain", "缺少参数");
+    }
+  });
+  
+  // 默认页面
+  server.on("/", []() {
+    server.sendHeader("Location", "/index.html", true);
+    server.send(302, "text/plain", "");
+  });
+  
+  // 启动服务器
+  server.begin();
+  Serial.println("HTTP服务器已启动");
+}
+
+// 学习红外命令
+void learnIRCommand(int commandIndex) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("红外学习模式");
+  display.print("请按下遥控器按键: ");
+  display.println(commandIndex);
+  display.display();
+  
+  Serial.print("学习命令 #");
+  Serial.println(commandIndex);
+  
+  unsigned long startTime = millis();
+  while (millis() - startTime < 10000) {  // 10秒超时
+    if (irrecv.decode(&results)) {
+      irCommands[commandIndex] = results.value;
+      irrecv.resume();
+      
+      Serial.print("命令 #");
+      Serial.print(commandIndex);
+      Serial.print(" 学习成功: 0x");
+      Serial.println(results.value, HEX);
+      
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("学习成功!");
+      display.display();
+      delay(1000);
+      return;
+    }
+    delay(100);
+  }
+  
+  Serial.println("学习超时");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("学习超时!");
+  display.display();
+  delay(1000);
+}
+
+// 发送红外命令
+void sendIRCommand() {
+  if (!irCommands[0]) return;  // 如果没有学习任何命令，直接返回
+  
+  // 根据当前状态发送对应的红外命令
+  // 这里需要根据实际空调遥控器的命令逻辑进行调整
+  
+  if (aircon.power) {
+    // 开机命令
+    irsend.sendNEC(irCommands[0], 32);
+    delay(500);
+    
+    // 根据模式发送命令
+    if (aircon.mode != -1) {
+      irsend.sendNEC(irCommands[1 + aircon.mode], 32);
+      delay(500);
+    }
+    
+    // 根据温度发送命令
+    if (aircon.temperature != -1) {
+      int tempDiff = aircon.temperature - 26;  // 假设默认温度是26度
+      if (tempDiff > 0) {
+        for (int i = 0; i < tempDiff; i++) {
+          irsend.sendNEC(irCommands[6], 32);  // 温度+
+          delay(300);
+        }
+      } else if (tempDiff < 0) {
+        for (int i = 0; i < -tempDiff; i++) {
+          irsend.sendNEC(irCommands[7], 32);  // 温度-
+          delay(300);
+        }
+      }
+    }
+    
+    // 根据风速发送命令
+    if (aircon.fanSpeed != -1) {
+      irsend.sendNEC(irCommands[8 + aircon.fanSpeed], 32);
+      delay(500);
+    }
+    
+    // 根据扫风状态发送命令
+    if (aircon.swing != -1) {
+      if (aircon.swing) {
+        irsend.sendNEC(irCommands[11], 32);  // 扫风开
+      }
+    }
+  } else {
+    // 关机命令
+    irsend.sendNEC(irCommands[0], 32);
+  }
+}
+
+// 处理接收到的红外命令
+void handleIRCommand() {
+  // 这里可以添加对原生遥控器命令的学习和响应
+  Serial.print("收到红外命令: 0x");
+  Serial.println(results.value, HEX);
+  
+  // 简单示例：根据命令值执行相应操作
+  // 实际应用中需要根据具体遥控器的命令值进行映射
+  
+  if (results.value == irCommands[0]) {  // 假设0是电源键
+    aircon.power = !aircon.power;
+  } else if (results.value == irCommands[1]) {  // 模式键
+    aircon.mode = (aircon.mode + 1) % 5;
+  } else if (results.value == irCommands[6]) {  // 温度+
+    if (aircon.temperature < 30) aircon.temperature++;
+  } else if (results.value == irCommands[7]) {  // 温度-
+    if (aircon.temperature > 16) aircon.temperature--;
+  }
+  
+  saveSettings();
+  updateDisplay();
+}
+
+// 更新OLED显示
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  
+  // 标题
+  display.println("ESP32空调伴侣");
+  
+  // 电源状态
+  display.print("电源: ");
+  display.println(aircon.power ? "开启" : "关闭");
+  
+  if (aircon.power) {
+    // 模式
+    display.print("模式: ");
+    switch(aircon.mode) {
+      case 0: display.println("自动"); break;
+      case 1: display.println("制冷"); break;
+      case 2: display.println("制热"); break;
+      case 3: display.println("除湿"); break;
+      case 4: display.println("送风"); break;
+    }
+    
+    // 温度
+    display.print("温度: ");
+    display.print(aircon.temperature);
+    display.println("°C");
+    
+    // 风速
+    display.print("风速: ");
+    switch(aircon.fanSpeed) {
+      case 0: display.println("自动"); break;
+      case 1: display.println("低速"); break;
+      case 2: display.println("中速"); break;
+      case 3: display.println("高速"); break;
+    }
+    
+    // 扫风
+    display.print("扫风: ");
+    display.println(aircon.swing ? "开启" : "关闭");
+  }
+  
+  // 电池状态
+  display.print("电池: ");
+  display.print(aircon.batteryLevel);
+  display.println("%");
+  
+  // 定时状态
+  if (aircon.timerEnabled) {
+    display.print("定时: ");
+    display.print(aircon.timerHours);
+    display.println("小时后");
+  }
+  
+  display.display();
+}
+
+// 更新电池电量
+void updateBatteryLevel() {
+  // 读取ADC值并转换为电压
+  int adcValue = analogRead(BATTERY_PIN);
+  float voltage = adcValue * (3.3 / 4095.0) * 2;  // 分压电路倍数
+  
+  // 将电压转换为电量百分比 (假设电池电压范围为3.0V-4.2V)
+  aircon.batteryLevel = constrain((voltage - 3.0) / 1.2 * 100, 0, 100);
+}
+
+// 检查定时任务
+void checkTimer() {
+  static unsigned long lastTimerCheck = 0;
+  
+  if (aircon.timerEnabled && millis() - lastTimerCheck > 60000) {  // 每分钟检查一次
+    lastTimerCheck = millis();
+    
+    aircon.timerHours -= 1.0 / 60.0;  // 减去1分钟
+    
+    if (aircon.timerHours <= 0) {
+      aircon.timerEnabled = false;
+      aircon.power = false;  // 定时时间到，关闭空调
+      sendIRCommand();
+      saveSettings();
+      updateDisplay();
+    }
+  }
+}
+
+// 保存设置到EEPROM
+void saveSettings() {
+  // 保存红外命令
+  EEPROM.put(IR_DATA_ADDR, irCommands);
+  
+  // 保存空调状态
+  EEPROM.put(STATE_DATA_ADDR, aircon);
+  
+  EEPROM.commit();
+  Serial.println("设置已保存");
+}
+
+// 从EEPROM加载设置
+void loadSettings() {
+  // 加载红外命令
+  EEPROM.get(IR_DATA_ADDR, irCommands);
+  
+  // 加载空调状态
+  EEPROM.get(STATE_DATA_ADDR, aircon);
+  
+  // 检查是否是第一次启动
+  if (aircon.temperature == 0) {
+    // 初始化默认值
+    aircon.power = false;
+    aircon.mode = 0;
+    aircon.temperature = 26;
+    aircon.fanSpeed = 0;
+    aircon.swing = false;
+    aircon.timerEnabled = false;
+    aircon.timerHours = 0;
+  }
+  
+  Serial.println("设置已加载");
+}    
